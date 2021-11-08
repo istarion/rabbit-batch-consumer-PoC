@@ -46,7 +46,6 @@ public class RabbitBatchConsumer {
     }
 
     private List<Delivery> waitAndConsume(String consumerTag, Duration maxInterval) throws InterruptedException, IOException {
-        logger.info("Consumer tag in wait: {}", consumerTag);
         synchronized (isOpen) {
             Instant before = Instant.now();
             while (before.plus(maxInterval).isAfter(Instant.now())) {
@@ -64,27 +63,31 @@ public class RabbitBatchConsumer {
 
     private void cancelSubscriptionIfNeeded(String consumerTag) throws IOException {
         if (isOpen.compareAndSet(true, false)) {
-            logger.info("Cancelling {}", consumerTag);
+            logger.trace("Cancelling {}", consumerTag);
             channel.basicCancel(consumerTag);
-            logger.info("Cancelled {}", consumerTag);
+            logger.debug("Cancelled {}", consumerTag);
         }
     }
 
     private class BatchDeliveryCallback implements DeliverCallback {
         @Override
         public void handle(String consumerTag, Delivery message) throws IOException {
-            logger.info("Consumer tag: {}", consumerTag);
+            logger.debug("Handling rabbit message, Consumer tag: {}, envelope: {}", consumerTag, message.getEnvelope());
             synchronized (isOpen) {
                 if (isOpen.get() && deliveryList.offer(message)) {
-                    logger.info("queue size: {}", deliveryList.size());
+                    logger.debug("queue size: {}", deliveryList.size());
                     lastInsert = System.nanoTime();
                     channel.basicAck(message.getEnvelope().getDeliveryTag(), false);
-                    logger.info("Acked message: {}", new String(message.getBody()));
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Acked message: {}", new String(message.getBody()));
+                    }
                 } else {
                     cancelSubscriptionIfNeeded(consumerTag);
                     isOpen.notifyAll();
                     channel.basicNack(message.getEnvelope().getDeliveryTag(), false, true);
-                    logger.info("Nacked message: {}", new String(message.getBody()));
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Nacked message: {}", new String(message.getBody()));
+                    }
                 }
             }
         }
