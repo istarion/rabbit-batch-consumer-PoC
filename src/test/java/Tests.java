@@ -94,9 +94,10 @@ public class Tests {
             fillQueue(channel, exchangeName, routingKey, 1000);
             long before = System.nanoTime();
             for (int i = 0; i < count; ++i) {
-                GetResponse resp = channel.basicGet(queueName, true);
+                GetResponse resp = channel.basicGet(queueName, false);
                 logger.info("Resp: {}", resp);
                 logger.info("Body: {}", new String(resp.getBody()));
+                channel.basicAck(resp.getEnvelope().getDeliveryTag(), false);
             }
             double processingTime = (System.nanoTime() - before) / 1_000_000.0;
             logger.info("Processing time: {}ms", processingTime);
@@ -174,17 +175,48 @@ public class Tests {
 
             long before = System.nanoTime();
             channel.basicQos(qos, false);
-            List<Delivery> messages = RabbitBatchConsumer.consumeBatch(
+            List<byte[]> messages = RabbitBatchConsumer.consumeBatch(
                     channel, queueName, batchSize, Duration.ofSeconds(3), Duration.ofMillis(50)
             );
 
             logger.info("Resp: {}", messages);
             double processingTimeMillis = (System.nanoTime() - before) / 1_000_000.0;
             logger.info("Processing time: {}ms", processingTimeMillis);
+            Thread.sleep(1000);
             return processingTimeMillis;
         } catch (InterruptedException e) {
             e.printStackTrace();
             throw e;
+        } catch (Exception e) {
+            logger.info("Exception!", e);
+            return 0;
+        }
+    }
+
+    private double testRabbitBatchConsumerMultipleAck(int qos, int batchSize) throws IOException, TimeoutException, InterruptedException {
+        String exchangeName = "testConsumeBatchWithClass";
+        String routingKey = "test";
+        String queueName = getTempQueue(exchangeName, routingKey);
+        try (Channel channel = rabbitConnection.createChannel()) {
+            fillQueue(channel, exchangeName, routingKey, 10000);
+
+            long before = System.nanoTime();
+            channel.basicQos(qos, false);
+            List<byte[]> messages = RabbitBatchConsumerMultiAck.consumeBatch(
+                    channel, queueName, batchSize, Duration.ofSeconds(3), Duration.ofMillis(50), qos
+            );
+
+            logger.info("Resp: {}", messages);
+            double processingTimeMillis = (System.nanoTime() - before) / 1_000_000.0;
+            logger.info("Processing time: {}ms", processingTimeMillis);
+            Thread.sleep(1000);
+            return processingTimeMillis;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw e;
+        } catch (Exception e) {
+            logger.info("Exception!", e);
+            return 0;
         }
     }
 
@@ -202,7 +234,7 @@ public class Tests {
             channel.basicQos(12);
 
             ExecutorService executorService = Executors.newCachedThreadPool();
-            List<Future<List<Delivery>>> futures = new ArrayList<>();
+            List<Future<List<byte[]>>> futures = new ArrayList<>();
             for (int i = 0; i < 3; ++i) {
                 futures.add(executorService.submit(() ->
                         RabbitBatchConsumer.consumeBatch(
@@ -212,10 +244,52 @@ public class Tests {
             }
 
             for (int i = 0; i < futures.size(); ++i) {
-                List<Delivery> deliveries = futures.get(i).get();
+                List<byte[]> deliveries = futures.get(i).get();
                 logger.info(
                         "Resp {}: {}", i,
-                        deliveries.stream().map(delivery -> new String(delivery.getBody(), StandardCharsets.UTF_8))
+                        deliveries.stream().map(delivery -> new String(delivery, StandardCharsets.UTF_8))
+                                .collect(Collectors.toList())
+                );
+                Assertions.assertEquals(100, deliveries.size());
+            }
+
+            logger.info("Processing time: {}ms", (System.nanoTime() - before) / 1_000_000.0);
+
+            Thread.sleep(10);
+            Assertions.assertEquals(100, channel.messageCount(queueName));
+        } catch (InterruptedException | ExecutionException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Test
+    public void testConsumeBatchWithClassParallelMultiack() throws IOException, TimeoutException {
+        String exchangeName = "testConsumeBatchWithClassParallel";
+        String routingKey = "test";
+        String queueName = getTempQueue(exchangeName, routingKey);
+        try (Channel channel = rabbitConnection.createChannel()) {
+            fillQueue(channel, exchangeName, routingKey, 400);
+            Thread.sleep(10);
+            Assertions.assertEquals(400, channel.messageCount(queueName));
+
+            long before = System.nanoTime();
+            channel.basicQos(12);
+
+            ExecutorService executorService = Executors.newCachedThreadPool();
+            List<Future<List<byte[]>>> futures = new ArrayList<>();
+            for (int i = 0; i < 3; ++i) {
+                futures.add(executorService.submit(() ->
+                        RabbitBatchConsumerMultiAck.consumeBatch(
+                                channel, queueName, 100, Duration.ofSeconds(3), Duration.ofMillis(100), 12
+                        ))
+                );
+            }
+
+            for (int i = 0; i < futures.size(); ++i) {
+                List<byte[]> deliveries = futures.get(i).get();
+                logger.info(
+                        "Resp {}: {}", i,
+                        deliveries.stream().map(delivery -> new String(delivery, StandardCharsets.UTF_8))
                                 .collect(Collectors.toList())
                 );
                 Assertions.assertEquals(100, deliveries.size());
@@ -233,22 +307,24 @@ public class Tests {
     @Test
     public void showStats() throws IOException, TimeoutException, InterruptedException {
         List<StatRun> statRuns = new ArrayList<>();
-        for (int batchSize : new int[]{1, 30, 100}) {
-            for (int qos : new int[]{1, 5, 12}) {
-                statRuns.add(
-                        new StatRun(batchSize, qos, "basicGet", batchReadWithBasicGet(batchSize))
-                );
+        for (int batchSize : new int[]{1, 10, 30, 100, 500}) {
+            statRuns.add(
+                    new StatRun(batchSize, 1, "basicGet", batchReadWithBasicGet(batchSize))
+            );
+            for (int qos : new int[]{1, 5, 12, 50}) {
                 statRuns.add(
                         new StatRun(batchSize, qos, "RabbitBatchConsumer", testRabbitBatchConsumer(qos, batchSize))
+                );
+                statRuns.add(
+                        new StatRun(batchSize, qos, "RabbitBatchConsumerMultiAck", testRabbitBatchConsumerMultipleAck(qos, batchSize))
                 );
             }
         }
 
-
         System.out.println("RESULTS:");
         System.out.println("== ToxyProxy latency 10ms =====================================");
         for (StatRun statRun : statRuns) {
-            System.out.printf("| %-20s | batch=%-3d | qos=%-3d | %-12fms |\n",
+            System.out.printf("| %-30s | batch=%-3d | qos=%-3d | %-12fms |\n",
                     statRun.getType(), statRun.getBatchSize(), statRun.getQos(), statRun.getValue()
             );
         }
