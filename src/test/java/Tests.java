@@ -232,35 +232,27 @@ public class Tests {
 
     @Test
     public void showStats() throws IOException, TimeoutException, InterruptedException {
-        double basicGet1 = batchReadWithBasicGet(1);
-        double rbcQ11 = testRabbitBatchConsumer(1, 1);
-        double rbcQ51 = testRabbitBatchConsumer(5, 1);
-        double rbcQ121 = testRabbitBatchConsumer(12, 1);
+        List<StatRun> statRuns = new ArrayList<>();
+        for (int batchSize : new int[]{1, 30, 100}) {
+            for (int qos : new int[]{1, 5, 12}) {
+                statRuns.add(
+                        new StatRun(batchSize, qos, "basicGet", batchReadWithBasicGet(batchSize))
+                );
+                statRuns.add(
+                        new StatRun(batchSize, qos, "RabbitBatchConsumer", testRabbitBatchConsumer(qos, batchSize))
+                );
+            }
+        }
 
-        double basicGet30 = batchReadWithBasicGet(30);
-        double rbcQ130 = testRabbitBatchConsumer(1, 30);
-        double rbcQ530 = testRabbitBatchConsumer(5, 30);
-        double rbcQ1230 = testRabbitBatchConsumer(12, 30);
 
-        double basicGet100 = batchReadWithBasicGet(100);
-        double rbcQ1100 = testRabbitBatchConsumer(1, 100);
-        double rbcQ5100 = testRabbitBatchConsumer(5, 100);
-        double rbcQ12100 = testRabbitBatchConsumer(12, 100);
-
-        logger.info("RESULTS:");
-        logger.info("== ToxyProxy latency 10ms ======================================");
-        logger.info("BasicGet batch(1):\t\t\t\t\t\t {}ms", basicGet1);
-        logger.info("RabbitBatchConsumer batch(1) qos=1:\t\t {}ms", rbcQ11);
-        logger.info("RabbitBatchConsumer batch(1) qos=5:\t\t {}ms", rbcQ51);
-        logger.info("RabbitBatchConsumer batch(1) qos=12:\t\t {}ms\n", rbcQ121);
-        logger.info("BasicGet batch(30):\t\t\t\t\t\t {}ms", basicGet30);
-        logger.info("RabbitBatchConsumer batch(30) qos=1:\t\t {}ms", rbcQ130);
-        logger.info("RabbitBatchConsumer batch(30) qos=5:\t\t {}ms", rbcQ530);
-        logger.info("RabbitBatchConsumer batch(30) qos=12:\t {}ms\n", rbcQ1230);
-        logger.info("BasicGet batch(100):\t\t\t\t\t\t {}ms", basicGet100);
-        logger.info("RabbitBatchConsumer batch(100) qos=1:\t {}ms", rbcQ1100);
-        logger.info("RabbitBatchConsumer batch(100) qos=5:\t {}ms", rbcQ5100);
-        logger.info("RabbitBatchConsumer batch(100) qos=12:\t {}ms", rbcQ12100);
+        System.out.println("RESULTS:");
+        System.out.println("== ToxyProxy latency 10ms =====================================");
+        for (StatRun statRun : statRuns) {
+            System.out.printf("| %-20s | batch=%-3d | qos=%-3d | %-12fms |\n",
+                    statRun.getType(), statRun.getBatchSize(), statRun.getQos(), statRun.getValue()
+            );
+        }
+        System.out.println("===============================================================");
     }
 
     @NotNull
