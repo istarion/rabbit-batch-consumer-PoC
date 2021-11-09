@@ -35,18 +35,23 @@ public class Tests {
 
     @Container
     public RabbitMQContainer rabbitMQContainer = new RabbitMQContainer("rabbitmq").withNetwork(network);
+    private ToxiproxyContainer.ContainerProxy toxiRabbit;
 
     public Connection rabbitConnection;
 
     @BeforeEach
     public void setUp() throws IOException, TimeoutException {
-        ToxiproxyContainer.ContainerProxy toxiRabbit = toxiproxyContainer.getProxy(rabbitMQContainer, 5672);
+        toxiRabbit = toxiproxyContainer.getProxy(rabbitMQContainer, 5672);
         toxiRabbit.toxics()
-                .latency("latency-up", ToxicDirection.DOWNSTREAM, 20)
-                .setJitter(10);
+                .latency("latency-up", ToxicDirection.DOWNSTREAM, 10)
+                .setJitter(7);
         toxiRabbit.toxics()
-                .latency("latency-down", ToxicDirection.DOWNSTREAM, 20)
-                .setJitter(10);
+                .latency("latency-down", ToxicDirection.DOWNSTREAM, 10)
+                .setJitter(7);
+        toxiRabbit.toxics()
+                .bandwidth("bandwidth-up", ToxicDirection.UPSTREAM, 1024);  // 1 MB/s
+        toxiRabbit.toxics()
+                .bandwidth("bandwidth-down", ToxicDirection.DOWNSTREAM, 1024);  // 1 MB/s
         ConnectionFactory factory = new ConnectionFactory();
         factory.setHost(toxiRabbit.getContainerIpAddress());
         factory.setPort(toxiRabbit.getProxyPort());
@@ -78,18 +83,24 @@ public class Tests {
 
     @Test
     public void testBatch() throws IOException, TimeoutException {
+        batchReadWithBasicGet(100);
+    }
+
+    private double batchReadWithBasicGet(int count) throws IOException, TimeoutException {
         String exchangeName = "testBatch";
         String routingKey = "test";
         String queueName = getTempQueue(exchangeName, routingKey);
         try (Channel channel = rabbitConnection.createChannel()) {
-            fillQueue(channel, exchangeName, routingKey, 10000);
+            fillQueue(channel, exchangeName, routingKey, 1000);
             long before = System.nanoTime();
-            for (int i = 0; i < 100; ++i) {
+            for (int i = 0; i < count; ++i) {
                 GetResponse resp = channel.basicGet(queueName, true);
                 logger.info("Resp: {}", resp);
                 logger.info("Body: {}", new String(resp.getBody()));
             }
-            logger.info("Processing time: {}ms", (System.nanoTime() - before) / 1_000_000.0);
+            double processingTime = (System.nanoTime() - before) / 1_000_000.0;
+            logger.info("Processing time: {}ms", processingTime);
+            return processingTime;
         }
     }
 
@@ -105,10 +116,20 @@ public class Tests {
     }
 
     private void fillQueue(Channel channel, String exchangeName, String routingKey, int count) throws IOException {
+        channel.confirmSelect();
         for (int i = 0; i < count; i++) {
             byte[] messageBodyBytes = ("Hello, world! " + i).getBytes();
             channel.basicPublish(exchangeName, routingKey, null, messageBodyBytes);
         }
+        try {
+            channel.waitForConfirmsOrDie(10000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (TimeoutException e) {
+            e.printStackTrace();
+        }
+//        channel.waitForConfirms()
+        logger.info("Queue filled");
     }
 
     @Test
@@ -117,7 +138,7 @@ public class Tests {
         String routingKey = "test";
         String queueName = getTempQueue(exchangeName, routingKey);
         try (Channel channel = rabbitConnection.createChannel()) {
-            fillQueue(channel, exchangeName, routingKey, 10000);
+            fillQueue(channel, exchangeName, routingKey, 1000);
 
             long before = System.nanoTime();
             channel.basicQos(1);
@@ -130,7 +151,21 @@ public class Tests {
     }
 
     @Test
-    public void testConsumeBatchWithClass() throws IOException, TimeoutException {
+    public void testRabbitBatchConsumerWithoutQos() throws IOException, TimeoutException, InterruptedException {
+        testRabbitBatchConsumer(1, 100);
+    }
+
+    @Test
+    public void testRabbitBatchConsumerWithoutQosSingle() throws IOException, TimeoutException, InterruptedException {
+        testRabbitBatchConsumer(1, 1);
+    }
+
+    @Test
+    public void testRabbitBatchConsumerQos() throws IOException, TimeoutException, InterruptedException {
+        testRabbitBatchConsumer(12, 100);
+    }
+
+    private double testRabbitBatchConsumer(int qos, int batchSize) throws IOException, TimeoutException, InterruptedException {
         String exchangeName = "testConsumeBatchWithClass";
         String routingKey = "test";
         String queueName = getTempQueue(exchangeName, routingKey);
@@ -138,15 +173,18 @@ public class Tests {
             fillQueue(channel, exchangeName, routingKey, 10000);
 
             long before = System.nanoTime();
-            channel.basicQos(10);
+            channel.basicQos(qos, false);
             List<Delivery> messages = RabbitBatchConsumer.consumeBatch(
-                    channel, queueName, 100, Duration.ofSeconds(3), Duration.ofMillis(100)
+                    channel, queueName, batchSize, Duration.ofSeconds(3), Duration.ofMillis(50)
             );
 
             logger.info("Resp: {}", messages);
-            logger.info("Processing time: {}ms", (System.nanoTime() - before) / 1_000_000.0);
+            double processingTimeMillis = (System.nanoTime() - before) / 1_000_000.0;
+            logger.info("Processing time: {}ms", processingTimeMillis);
+            return processingTimeMillis;
         } catch (InterruptedException e) {
             e.printStackTrace();
+            throw e;
         }
     }
 
@@ -190,6 +228,39 @@ public class Tests {
         } catch (InterruptedException | ExecutionException e) {
             e.printStackTrace();
         }
+    }
+
+    @Test
+    public void showStats() throws IOException, TimeoutException, InterruptedException {
+        double basicGet1 = batchReadWithBasicGet(1);
+        double rbcQ11 = testRabbitBatchConsumer(1, 1);
+        double rbcQ51 = testRabbitBatchConsumer(5, 1);
+        double rbcQ121 = testRabbitBatchConsumer(12, 1);
+
+        double basicGet30 = batchReadWithBasicGet(30);
+        double rbcQ130 = testRabbitBatchConsumer(1, 30);
+        double rbcQ530 = testRabbitBatchConsumer(5, 30);
+        double rbcQ1230 = testRabbitBatchConsumer(12, 30);
+
+        double basicGet100 = batchReadWithBasicGet(100);
+        double rbcQ1100 = testRabbitBatchConsumer(1, 100);
+        double rbcQ5100 = testRabbitBatchConsumer(5, 100);
+        double rbcQ12100 = testRabbitBatchConsumer(12, 100);
+
+        logger.info("RESULTS:");
+        logger.info("== ToxyProxy latency 10ms ======================================");
+        logger.info("BasicGet batch(1):\t\t\t\t\t\t {}ms", basicGet1);
+        logger.info("RabbitBatchConsumer batch(1) qos=1:\t\t {}ms", rbcQ11);
+        logger.info("RabbitBatchConsumer batch(1) qos=5:\t\t {}ms", rbcQ51);
+        logger.info("RabbitBatchConsumer batch(1) qos=12:\t\t {}ms\n", rbcQ121);
+        logger.info("BasicGet batch(30):\t\t\t\t\t\t {}ms", basicGet30);
+        logger.info("RabbitBatchConsumer batch(30) qos=1:\t\t {}ms", rbcQ130);
+        logger.info("RabbitBatchConsumer batch(30) qos=5:\t\t {}ms", rbcQ530);
+        logger.info("RabbitBatchConsumer batch(30) qos=12:\t {}ms\n", rbcQ1230);
+        logger.info("BasicGet batch(100):\t\t\t\t\t\t {}ms", basicGet100);
+        logger.info("RabbitBatchConsumer batch(100) qos=1:\t {}ms", rbcQ1100);
+        logger.info("RabbitBatchConsumer batch(100) qos=5:\t {}ms", rbcQ5100);
+        logger.info("RabbitBatchConsumer batch(100) qos=12:\t {}ms", rbcQ12100);
     }
 
     @NotNull

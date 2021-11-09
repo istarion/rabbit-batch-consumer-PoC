@@ -73,21 +73,21 @@ public class RabbitBatchConsumer {
         @Override
         public void handle(String consumerTag, Delivery message) throws IOException {
             logger.debug("Handling rabbit message, Consumer tag: {}, envelope: {}", consumerTag, message.getEnvelope());
-            synchronized (isOpen) {
-                if (isOpen.get() && deliveryList.offer(message)) {
-                    logger.debug("queue size: {}", deliveryList.size());
-                    lastInsert = System.nanoTime();
-                    channel.basicAck(message.getEnvelope().getDeliveryTag(), false);
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Acked message: {}", new String(message.getBody()));
-                    }
-                } else {
-                    cancelSubscriptionIfNeeded(consumerTag);
+            if (isOpen.get() && deliveryList.offer(message)) {
+                logger.debug("queue size: {}", deliveryList.size());
+                lastInsert = System.nanoTime();
+                channel.basicAck(message.getEnvelope().getDeliveryTag(), false);
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Acked message: {}", new String(message.getBody()));
+                }
+            } else {
+                cancelSubscriptionIfNeeded(consumerTag);
+                synchronized (isOpen) {
                     isOpen.notifyAll();
-                    channel.basicNack(message.getEnvelope().getDeliveryTag(), false, true);
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Nacked message: {}", new String(message.getBody()));
-                    }
+                }
+                channel.basicNack(message.getEnvelope().getDeliveryTag(), false, true);
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Nacked message: {}", new String(message.getBody()));
                 }
             }
         }
