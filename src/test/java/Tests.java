@@ -1,10 +1,7 @@
 import com.rabbitmq.client.*;
 import eu.rekawek.toxiproxy.model.ToxicDirection;
 import org.jetbrains.annotations.NotNull;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.Network;
@@ -19,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 @Testcontainers
@@ -35,23 +33,22 @@ public class Tests {
 
     @Container
     public RabbitMQContainer rabbitMQContainer = new RabbitMQContainer("rabbitmq").withNetwork(network);
-    private ToxiproxyContainer.ContainerProxy toxiRabbit;
 
     public Connection rabbitConnection;
 
     @BeforeEach
     public void setUp() throws IOException, TimeoutException {
-        toxiRabbit = toxiproxyContainer.getProxy(rabbitMQContainer, 5672);
+        ToxiproxyContainer.ContainerProxy toxiRabbit = toxiproxyContainer.getProxy(rabbitMQContainer, 5672);
         toxiRabbit.toxics()
-                .latency("latency-up", ToxicDirection.DOWNSTREAM, 10)
-                .setJitter(7);
+                .latency("latency-up", ToxicDirection.DOWNSTREAM, 2)
+                .setJitter(5);
         toxiRabbit.toxics()
-                .latency("latency-down", ToxicDirection.DOWNSTREAM, 10)
-                .setJitter(7);
+                .latency("latency-down", ToxicDirection.DOWNSTREAM, 2)
+                .setJitter(5);
         toxiRabbit.toxics()
-                .bandwidth("bandwidth-up", ToxicDirection.UPSTREAM, 1024);  // 1 MB/s
+                .bandwidth("bandwidth-up", ToxicDirection.UPSTREAM, 4096);  // 1 MB/s
         toxiRabbit.toxics()
-                .bandwidth("bandwidth-down", ToxicDirection.DOWNSTREAM, 1024);  // 1 MB/s
+                .bandwidth("bandwidth-down", ToxicDirection.DOWNSTREAM, 4096);  // 1 MB/s
         ConnectionFactory factory = new ConnectionFactory();
         factory.setHost(toxiRabbit.getContainerIpAddress());
         factory.setPort(toxiRabbit.getProxyPort());
@@ -119,11 +116,11 @@ public class Tests {
     private void fillQueue(Channel channel, String exchangeName, String routingKey, int count) throws IOException {
         channel.confirmSelect();
         for (int i = 0; i < count; i++) {
-            byte[] messageBodyBytes = ("Hello, world! " + i).getBytes();
+            byte[] messageBodyBytes = ("Hello, world! ".repeat(50) + i).getBytes();
             channel.basicPublish(exchangeName, routingKey, null, messageBodyBytes);
         }
         try {
-            channel.waitForConfirmsOrDie(10000);
+            channel.waitForConfirmsOrDie(100000);
         } catch (InterruptedException e) {
             e.printStackTrace();
         } catch (TimeoutException e) {
@@ -193,7 +190,181 @@ public class Tests {
         }
     }
 
-    private double testRabbitBatchConsumerMultipleAck(int qos, int batchSize) throws IOException, TimeoutException, InterruptedException {
+    //    100_000   =  64547.692838ms
+//    1_000_000 = 280339.738331ms
+    @Disabled("Long")
+    @Test
+    public void testMillionGet() throws IOException, TimeoutException, InterruptedException {
+        final int TEST_SIZE = 1000000;
+        String exchangeName = "testMillionGet";
+        String routingKey = "test";
+        String queueName = getTempQueue(exchangeName, routingKey);
+        int qos = 20;
+        int batchSize = 500;
+        AtomicInteger receivedCount = new AtomicInteger(0);
+        try (Channel channel = rabbitConnection.createChannel()) {
+            fillQueue(channel, exchangeName, routingKey, TEST_SIZE);
+
+            long before = System.nanoTime();
+            channel.basicQos(qos, false);
+            ExecutorService executorService = Executors.newFixedThreadPool(4);
+            Runnable task = new Runnable() {
+                @Override
+                public void run() {
+                    List<byte[]> messages;
+                    do {
+                        try {
+                            messages = RabbitBatchConsumer.consumeBatch(
+                                    channel, queueName, batchSize, Duration.ofSeconds(3), Duration.ofMillis(50)
+                            );
+                        } catch (IOException | InterruptedException e) {
+                            e.printStackTrace();
+                            throw new RuntimeException(e);
+                        }
+                        logger.info("Million test {}, got {}", receivedCount.get(), messages.size());
+                    } while (receivedCount.addAndGet(messages.size()) < TEST_SIZE);
+                }
+            };
+            Future<?> f1 = executorService.submit(task);
+            Future<?> f2 = executorService.submit(task);
+            Future<?> f3 = executorService.submit(task);
+            Future<?> f4 = executorService.submit(task);
+
+            f1.get();
+            f2.get();
+            f3.get();
+            f4.get();
+
+            double processingTimeMillis = (System.nanoTime() - before) / 1_000_000.0;
+            logger.info("Processing time: {}ms", processingTimeMillis);
+            Thread.sleep(1000);
+//            return processingTimeMillis;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw e;
+        } catch (Exception e) {
+            logger.info("Exception!", e);
+        }
+    }
+
+    @Test
+    public void lotOfSubscriptions() throws IOException, TimeoutException, InterruptedException {
+        final int SUB_SIZE = 10_000;
+        String exchangeName = "lotOfSubscriptions";
+        String routingKey = "test";
+        String queueName = getTempQueue(exchangeName, routingKey);
+        int qos = 20;
+        int batchSize = 10;
+        AtomicInteger receivedCount = new AtomicInteger(0);
+        try (Channel channel = rabbitConnection.createChannel()) {
+//                fillQueue(channel, exchangeName, routingKey, TEST_SIZE);
+
+            long before = System.nanoTime();
+            channel.basicQos(qos, false);
+            for (int i = 0; i < SUB_SIZE; ++i) {
+                channel.basicConsume(
+                        queueName, true, (consumerTag, message) -> receivedCount.incrementAndGet(), (consumerTag, sig) -> {
+                        });
+            }
+
+            fillQueue(channel, exchangeName, routingKey, 1000);
+            while (receivedCount.get() < 1000) {
+                Thread.sleep(1000);
+                logger.info("Consumed: {}", receivedCount.get());
+            }
+            Thread.sleep(1000);
+
+        }
+    }
+
+    //    100_000   =  13050.919505ms
+//    1_000_000 = 124124.508242ms
+//    @Disabled("Long")
+    @Test
+    public void testPlainSubscribe() throws IOException, TimeoutException, InterruptedException {
+        final int TEST_SIZE = 1_000_000;
+        String exchangeName = "testPlainSubscribe";
+        String routingKey = "test";
+        String queueName = getTempQueue(exchangeName, routingKey);
+        int qos = 20;
+        int batchSize = 100;
+        AtomicInteger receivedCount = new AtomicInteger(0);
+        try (Channel channel = rabbitConnection.createChannel()) {
+            fillQueue(channel, exchangeName, routingKey, TEST_SIZE);
+
+            long before = System.nanoTime();
+            channel.basicQos(qos, false);
+            channel.basicConsume(
+                    queueName, true, (consumerTag, message) -> receivedCount.incrementAndGet(), (consumerTag, sig) -> {
+                    });
+            do {
+                Thread.sleep(1000);
+                logger.info("Million test, got {}", receivedCount.get());
+            } while (receivedCount.get() < TEST_SIZE);
+
+            double processingTimeMillis = (System.nanoTime() - before) / 1_000_000.0;
+            logger.info("Processing time: {}ms", processingTimeMillis);
+            Thread.sleep(1000);
+//            return processingTimeMillis;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw e;
+        } catch (Exception e) {
+            logger.info("Exception!", e);
+        }
+    }
+
+    @Test
+    public void testLeak() throws IOException, TimeoutException, InterruptedException {
+        final int TEST_SIZE = 100_000;
+        String exchangeName = "testLeak";
+        String routingKey = "test";
+        String queueName = getTempQueue(exchangeName, routingKey);
+        int qos = 20;
+        int batchSize = 100;
+        AtomicInteger receivedCount = new AtomicInteger(0);
+        try (Channel channel = rabbitConnection.createChannel()) {
+            fillQueue(channel, exchangeName, routingKey, TEST_SIZE);
+
+            long before = System.nanoTime();
+            channel.basicQos(qos, false);
+            ExecutorService executorService = Executors.newFixedThreadPool(16);
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < 42; ++i) {
+                futures.add(executorService.submit((Runnable) () -> {
+                            while (receivedCount.get() < TEST_SIZE) {
+                                List<byte[]> bytes = null;
+                                try {
+                                    bytes = RabbitBatchConsumer.consumeBatch(
+                                            channel, queueName, batchSize, Duration.ofSeconds(3), Duration.ofMillis(100)
+                                    );
+                                    receivedCount.addAndGet(bytes.size());
+                                } catch (IOException | InterruptedException e) {
+                                    logger.error("ex", e);
+                                    throw new RuntimeException(e);
+                                }
+                            }
+                        }
+                ));
+            }
+            do {
+                Thread.sleep(1000);
+                logger.info("Leak test, got {}", receivedCount.get());
+            } while (receivedCount.get() < TEST_SIZE);
+
+            double processingTimeMillis = (System.nanoTime() - before) / 1_000_000.0;
+            logger.info("Processing time: {}ms", processingTimeMillis);
+//            return processingTimeMillis;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw e;
+        } catch (Exception e) {
+            logger.info("Exception!", e);
+        }
+    }
+
+    private double testRabbitBatchConsumerMultipleAck(int qos, int batchSize) throws
+            IOException, TimeoutException, InterruptedException {
         String exchangeName = "testConsumeBatchWithClass";
         String routingKey = "test";
         String queueName = getTempQueue(exchangeName, routingKey);
@@ -315,9 +486,9 @@ public class Tests {
                 statRuns.add(
                         new StatRun(batchSize, qos, "RabbitBatchConsumer", testRabbitBatchConsumer(qos, batchSize))
                 );
-                statRuns.add(
-                        new StatRun(batchSize, qos, "RabbitBatchConsumerMultiAck", testRabbitBatchConsumerMultipleAck(qos, batchSize))
-                );
+//                statRuns.add(
+//                        new StatRun(batchSize, qos, "RabbitBatchConsumerMultiAck", testRabbitBatchConsumerMultipleAck(qos, batchSize))
+//                );
             }
         }
 

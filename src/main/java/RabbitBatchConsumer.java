@@ -7,8 +7,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class RabbitBatchConsumer {
@@ -19,7 +18,6 @@ public class RabbitBatchConsumer {
     private volatile long lastInsert = System.nanoTime();
     private final AtomicBoolean isOpen = new AtomicBoolean(true);
     private final Channel channel;
-
     private final RabbitConsumer rabbitConsumer = new RabbitConsumer();
 
     private RabbitBatchConsumer(int size, Duration waitInterval, Channel channel) {
@@ -33,7 +31,12 @@ public class RabbitBatchConsumer {
             Channel channel, String queueName, int maxCount, Duration timeout, Duration recheckInterval
     ) throws IOException, InterruptedException {
         RabbitBatchConsumer consumer = new RabbitBatchConsumer(maxCount, recheckInterval, channel);
-        String consumerTag = channel.basicConsume(queueName, false, consumer.rabbitConsumer);
+        String consumerTag;
+        synchronized (channel) {
+            consumerTag = channel.basicConsume(queueName, false, consumer.rabbitConsumer);
+        }
+
+        logger.debug("Subscribed to: {}", consumerTag);
         return consumer.waitAndConsume(consumerTag, timeout);
     }
 
@@ -56,7 +59,9 @@ public class RabbitBatchConsumer {
     private void cancelSubscriptionIfNeeded(String consumerTag) throws IOException {
         if (isOpen.compareAndSet(true, false)) {
             logger.debug("Cancelling {}", consumerTag);
-            channel.basicCancel(consumerTag);
+            synchronized (channel) {
+                channel.basicCancel(consumerTag);
+            }
             logger.debug("Cancelled {}", consumerTag);
             synchronized (isOpen) {
                 isOpen.notifyAll();
